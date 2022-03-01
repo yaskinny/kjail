@@ -1,0 +1,486 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+_info(){
+  printf '%s\n' "[INFO] ${@}"
+}
+
+_warn(){
+  printf >&2 '%s\n' "[WARNING] ${@}"
+}
+
+_err(){
+  printf >&2 '%s\n' "[ERROR] ${@}"
+  exit 1
+}
+
+## convert comma separated group names which is passed
+## by --groups|-g|$KJAIL_GROUPS to appropriate string
+## to use for organizations names in certificate
+_setGroups(){
+  if declare -p _groups &>/dev/null ; then
+    _orgs=
+    for _grp in ${_groups[@]} ; do
+      _orgs="${_orgs}/O=${_grp},"
+    done
+    _orgs=",${_orgs%,*}"
+  fi
+}
+
+## if --ssh-config|$KJAIL_SSH_CONFIG is set, output file for
+## ssh config will be /etc/ssh/sshd_config.d/<username>.conf
+## otherwise it will be <outputdir>/ssh.conf
+_sshConfig(){
+  if declare -p KJAIL_SSH_CONFIG &>/dev/null ; then
+    _sshConfig="/etc/ssh/sshd_config.d/${_username}.conf"
+  else
+    _sshConfig="${_outputDir}/ssh.conf"
+    _info "ssh config is not set. output will be written to file ${_sshConfig}"
+  fi
+}
+
+## create key and csr for new user to create csr kubernetes object with them
+_generateUserKey(){
+  _setGroups
+  openssl genpkey -outform PEM -out "${_outputDir}/${_username}.key" -algorithm RSA &>/dev/null
+  local _this
+  if declare -p _orgs &>/dev/null ; then
+    _this="/CN=${_username}${_orgs}"
+  else
+    _this="/CN=${_username}"
+  fi
+  openssl req -new -key "${_outputDir}/${_username}.key" -out "${_outputDir}/${_username}.csr" -subj "${_this}" &>/dev/null
+}
+
+## generate csr kubernetes object manifest and apply it
+_generateCSRManifest(){
+  cat<<THIS > "${_outputDir}/csr.yaml"
+  apiVersion: certificates.k8s.io/v1
+  kind: CertificateSigningRequest
+  metadata:
+    name: ${_username}
+  spec:
+    request: $(cat "${_outputDir}/${_username}.csr" | base64 -w0)
+    usages:
+    - digital signature
+    - key encipherment
+    - client auth
+    signerName: kubernetes.io/kube-apiserver-client
+THIS
+  kubectl apply -f "${_outputDir}/csr.yaml" &>/dev/null
+}
+
+## check if CSR is created in kubernetes
+_checkCSR(){
+  kubectl get csr -o go-template="{{ range .items }}{{ if eq .metadata.name \"${_username}\" }}
+  {{ printf \"%s\" \"true\" }}{{end}}{{end}}" | \
+    grep -q "true" && \
+    _info "csr for user ${_username} found in kubernetes" || \
+    _err "can not find a csr with ${_username} name in kubernetes"
+}
+
+## approve csr on kubernetes and get signed certificate from api server
+## to create kubeconfig file for new user
+_approveUserCsr(){
+  kubectl certificate approve "${_username}" &>/dev/null
+  kubectl get csr "${_username}" -o go-template='{{ .status.certificate }}' | \
+    base64 -d > "${_outputDir}/${_username}.crt"
+}
+
+## generate kubeconfig file for new user
+_generateKubeconfig(){
+  local _kubeConfig _clusterCA _clusterServer _clusterName
+  _kubeConfig="${_outputDir}/config"
+  _clusterCA="$( kubectl config view --raw -o go-template='{{ index (index .clusters 0).cluster "certificate-authority-data" }}' )"
+  _clusterServer="$( kubectl config view --raw -o go-template='{{ (index .clusters 0).cluster.server }}' )"
+  _clusterName="$( kubectl config view --raw -o go-template='{{ (index .clusters 0).name }}' )"
+  cat<<THIS > "${_kubeConfig}"
+apiVersion: v1
+clusters:
+- cluster:
+    certificate-authority-data: ${_clusterCA}
+    server: ${_clusterServer}
+  name: ${_clusterName}
+contexts:
+- context:
+    cluster: ${_clusterName}
+    namespace: default
+    user: ${_username}
+  name: ${_username}@${_clusterName}
+current-context: ${_username}@${_clusterName}
+kind: Config
+users:
+- name: ${_username}
+  user:
+    client-certificate-data: $( cat "${_outputDir}/${_username}.crt" | base64 -w0 )
+    client-key-data: $( cat "${_outputDir}/${_username}.key" | base64 -w0 )
+THIS
+}
+
+## check if public key file exists
+_pubkeyPath(){
+  if declare -p KJAIL_SSH_PUBKEY &>/dev/null ; then
+    _pubkeyPath="${KJAIL_SSH_PUBKEY}"
+    [[ -f "${_pubkeyPath}" ]] || _err "can not find file ${_pubkeyPath}"
+  else
+    _info "public key is not set. No public key will be added to user authorized keys."
+  fi
+}
+
+## check for groups
+_groups(){
+  if declare -p KJAIL_GROUPS &>/dev/null ; then
+    _groups=( $( tr ',' ' ' <<< "${KJAIL_GROUPS}" ) )
+  else
+    _info "no kubernetes group is set for new user"
+  fi
+}
+
+## check for password
+_password(){
+  if declare -p KJAIL_PASSWORD &>/dev/null ; then
+    _password="$(openssl passwd -6 "${KJAIL_PASSWORD}")"
+  else
+    _info "password is not set. user will be created passwordless"
+  fi
+}
+
+## check for chroot base directory
+_chrootDir(){
+  if declare -p KJAIL_BASEDIR &>/dev/null ; then
+    _chrootDir="${KJAIL_BASEDIR}"
+    [[ -d "${_chrootDir}" ]] && _err "${_chrootDir} already exists"
+  else
+    _err "base directory for jailing is not set"
+  fi
+}
+
+## check for username
+_username(){
+  if declare -p KJAIL_USERNAME &>/dev/null ; then
+    _username="${KJAIL_USERNAME}"
+    cat /etc/passwd | awk -F: -v u="${_username}" '$1==u {print}' | grep -q "${_username}" && _err "user already exist on system"
+  else
+    _err "username is not set."
+  fi
+}
+
+_readOnly(){
+  if declare -p KJAIL_NO_READ_ONLY &>/dev/null ; then
+    _info "writable jail will be created"
+  else
+    _info "read-only jail will be created"
+    _readOnly=true
+  fi
+}
+
+## check for output dir
+_outputDir(){
+  if declare -p KJAIL_OUTPUT &>/dev/null ; then
+    _outputDir="${KJAIL_OUTPUT}"
+    [[ -d "${_outputDir}" ]] && _err "directory ${_outputDir} already exist"
+  else
+    _outputDir="${HOME}/${_username}-kjail"
+    _info "output dir is not set"
+    mkdir --mode=0700 "${_outputDir}"
+  fi
+}
+
+## prepare jail environment for new user
+## create directories
+## create device files
+## copy bash and libraries
+## create user's home and related directories to ssh and kubernetes
+## create user
+_chrootBase(){
+  ## Create directories for jail
+  if [[ "${_readOnly}" == "true" ]]; then 
+    mkdir --mode=0755 -p "${_chrootDir}" "${_chrootDir}-ro"
+    chown root:root "${_chrootDir}" "${_chrootDir}-ro"
+    mount -o bind,ro "${_chrootDir}" "${_chrootDir}-ro"
+  else
+    mkdir --mode=0755 -p "${_chrootDir}"
+    chown root:root "${_chrootDir}"
+  fi
+
+  for dir in ${_dirs[@]} ; do
+    mkdir -p "${_chrootDir}/${dir}"
+  done
+
+  ## Create device files
+  for dev in ${_devFiles[@]} ; do
+    set $(tr ':' ' ' <<< ${dev})
+    mknod -m ${1} ${_chrootDir}/dev/${4} c ${2} ${3}
+  done
+
+  pushd ${_chrootDir} &>/dev/null
+  ln -sf usr/bin bin
+  ln -sf usr/sbin sbin
+  popd &>/dev/null
+
+  # Dependencies libs for commands
+  for _c in ${_cmds[@]} ; do
+    _cmd="$(readlink -f $(which "${_c}"))"
+    ldd "${_cmd}" | grep -oP '\/lib.*?(\s|$)' | while read -r ; do
+      _base=${REPLY}
+      cp --preserve $(readlink -f ${REPLY}) ${_chrootDir}${_base}
+      cp  "${_cmd}" "${_chrootDir}/usr/bin/${_cmd##*/}"
+    done
+  done
+
+  cp --preserve /lib/*/libns{l,s_}* "${_chrootDir}/lib/"
+  cp --preserve -r /etc/nsswitch.conf "${_chrootDir}/etc/nsswitch.conf"
+  ## TODO: do everything is needed?
+  cp --preserve -r /usr/share/terminfo/ "${_chrootDir}/usr/share/terminfo"
+  cp --preserve -r /etc/terminfo/ "${_chrootDir}/etc/"
+  cp --preserve -r /lib/terminfo/ "${_chrootDir}/lib/"
+
+
+  # Create user's home, dirs and files
+  _userHome="${_chrootDir}/home/${_username}"
+  mkdir --mode=0700 -p "${_userHome}/.kube"
+  mkdir --mode=0700 -p "${_userHome}/.ssh"
+  touch "${_userHome}/.kube/config"
+  touch "${_userHome}/.ssh/authorized_keys"
+  chmod 0600 "${_userHome}/.kube/config"
+  chmod 0600 "${_userHome}/.ssh/authorized_keys"
+  cp --preserve $(readlink -f $(which kubectl)) "${_chrootDir}/bin/kubectl"
+  cp /etc/skel/.{bashrc,profile} "${_userHome}/"
+  declare -p _pubkeyPath &>/dev/null && cat "${_pubkeyPath}" > "${_userHome}/.ssh/authorized_keys"
+
+  # Create user
+  if declare -p _password &> /dev/null; then
+    _p="--password ${_password}"
+  fi
+  _opts="${_username} -s /bin/bash -d /home/${_username} ${_p:- }"
+  useradd ${_opts}
+  chown "${_username}:${_username}" -R "${_userHome}"
+  for this in group passwd ; do
+    cat "/etc/${this}" | awk -F: -v u="${_username}" '$1==u {print}' > "${_chrootDir}/etc/${this}"
+  done
+}
+
+## print help message and exit with 0 code
+_help(){
+  cat <<-'THIS'
+kjail creates new user for kubernetes which is jailed in SSH access to just run kubectl commands.
+if You would like, You can rename this script to kubectl-kjail and use it as a kubernetes plugin like
+`kubectl kjail ...`
+
+
+Options:
+-u , --username , $KJAIL_USERNAME <username> (REQUIRED)
+  username to create jail and kubeconfig for it.
+  This name will be used as username in kubernetes certificate.(certificate common name/CN)
+
+-p, --password , $KJAIL_PASSWORD <password>
+  Password to set for new user
+
+-b , --base , $KJAIL_BASEDIR <full path> (REQUIRED)
+  Full path to a directory which does not exist. For each user this must be different.
+
+--no-read-only , $KJAIL_NO_READ_ONLY
+  If It's not set, a read-only jail environment will be created for user.(It is a read-only mount of writable directory)
+  Read-only environment will make some problems for kubectl which is in client-side and is not important, You can ignore them.
+
+-g, --groups , $KJAIL_GROUPS <groups>
+  Comma seperated names of groups to set for new user.
+  These names will be used in kubernetes certificate.(certificate organization/O)
+
+--ssh-pubkey , --pubkey , $KJAIL_SSH_PUBKEY <path>
+  Path to a public key to add in authorized keys for new user.
+
+--output-dir , $KJAIL_OUTPUT <path>
+  Path to a directory to save output files.
+  Directory shouldn't exists.
+
+--ssh-config , $KJAIL_SSH_CONFIG
+  If this command is used, SSH config will be written to `/etc/ssh/sshd_config.d/<username>.conf`.
+  Otherwise config will be written to `<output dir>/sshd.conf`
+
+-h , --help
+  shows this message
+
+
+Examples:
+kjail --username yaser --base /jails/yaser --password pswd123 --ssh-config
+
+env KJAIL_USERNAME=yaser KJAIL_BASEDIR=/jails/yaser KJAIL_PASSWORD='pswd123' KJAIL_SSH_CONFIG=yes kjail
+THIS
+  exit 0
+}
+
+# general variables
+## directories needed for jail environment
+_dirs=( dev etc home usr/{bin,sbin,share} lib/x86_64-linux-gnu lib64 )
+## device files needed for jail environment
+_devFiles=( 666:1:3:null 666:5:0:tty 666:1:5:zero 666:1:8:random  666:1:9:urandom )
+## commands (beside of kubectl) that will be available for user in jail environment
+## TODO: let user add other commands to it
+_cmds=( bash )
+## list of variables that is used for new environment
+_vars=( _username _chrootDir _password _pubkeyPath _groups _outputDir _sshConfig _readOnly )
+
+## checks before execute main function
+_preChecks(){
+  ## check for variables in _vars and run default function
+  ## for each variable.
+  for _var in ${_vars[@]}; do
+    if ! declare -p ${_var} &>/dev/null ; then
+      ${_var}
+    fi
+  done
+
+  ## check if kubectl is available on host
+  if ! command -v kubectl &> /dev/null ; then
+    _err "can not find kubectl binary, make sure It's in your \`PATH\`"
+  fi
+
+  ## check if kubernete config is available to use with kubectl to
+  ## create user in kubernetes
+  if ! ( [[  -f /etc/kubernetes/admin.conf || -f ${HOME}/.kube/config ]]  || declare -p KUBECONFIG &>/dev/null ); then
+    _err "can not find kubeconfig file"
+  fi
+}
+
+## copy contents of new user kubeconfig from <outputdir> to
+## <new user's home directory>/.kube/config
+## write ssh config for new jailed user in appropriate _sshConfig file
+_confs(){
+  cat "${_outputDir}/config" > "${_userHome}/.kube/config"
+  local _that
+  if declare -p _readOnly &>/dev/null ; then
+    _that="${_chrootDir}-ro"
+  else
+    _that="${_chrootDir}"
+  fi
+  cat <<THIS> "${_sshConfig}"
+Match User ${_username}
+  ChrootDirectory ${_that}
+  # Don't forget to set authentication options
+  # AuthenticationMethods THIS
+  # PasswordAuthentication THIS
+  # PubkeyAuthentication THIS
+  # And other options like TCP forwarding, X11 forwarding and ...
+THIS
+}
+
+## write a message for user after finishing script
+_helpMsg(){
+  cat <<-THIS
+SSH config for new user is in ${_sshConfig} file.
+Don't forget to reload SSH service to pickup new changes after moving SSH config to appropriate place.
+All related files to new user are written to files inside of ${_outputDir} directory.
+Don't leave these files on file system.
+THIS
+}
+
+
+## pre checks for parsing options
+
+## check if running user is root
+if (( ${UID} != 0 )); then
+  _err "You must be root to run this command"
+fi
+
+## check for enough arguments
+## two for user, two for base directory
+if (( ${#} < 4 )); then
+  if [[ "${1}" =~ -h|--help ]]; then
+    _help
+  fi
+  _err "Not enough arguments! passed ${#}, expected at least 4"
+else
+  set +u
+  while ! [[ -z ${1} ]]; do
+    case "${1}" in
+      -h|--help)
+        _help
+      ;;
+      --output-dir)
+        if [[ -n ${2} && "${2}" =~ ^[^-] ]]; then
+          _outputDir="${2}"
+          if [[ -d "${_outputDir}" ]]; then
+            _err "directory ${_outputDir} already exist"
+          else
+            mkdir "${_outputDir}"
+          fi
+          shift
+        else
+          _err "for ${1} expected a path as value but got: \`${2}\`"
+        fi
+      ;;
+      --ssh-config)
+        _sshConfig="/etc/ssh/sshd_config.d/${_username}.conf"
+      ;;
+      --ssh-pubkey|--pubkey)
+        if [[ -n ${2} && "${2}" =~ ^[^-] ]]; then
+          _pubkeyPath="${2}"
+          [[ -f ${_pubkeyPath} ]] || _err "can not find file ${_pubkeyPath}"
+          shift
+        else
+          _err "for ${1} expected path to a public key as value but got: \`${2}\`"
+        fi
+      ;;
+      -g|--groups)
+        if [[ -n ${2} && "${2}" =~ ^[^-] ]]; then
+          _groups=( $( tr ',' ' ' <<< "${2}") )
+          shift
+        else
+          _err "for ${1} expected list of comma seperated group names as value but got: \`${2}\`"
+        fi
+      ;;
+      -p|--password)
+        if [[ -n ${2} && "${2}" =~ ^[^-] ]]; then
+          _password="$(openssl passwd -6 "${2}")"
+          shift
+        else
+          _err "for ${1} expected password as value but got: \`${2}\`"
+        fi
+      ;;
+      --no-read-only)
+        _readOnly=false
+        _info "writable jail will be created"
+      ;;
+      -u|--username)
+        if [[ -n ${2} && "${2}" =~ ^[^-] ]]; then
+          _username="${2}"
+          cat /etc/passwd | awk -F: -v u="${_username}" '$1==u {print}' | grep -q "${_username}" && _err "user already exist on system"
+          shift
+        else
+          _err "for ${1} expected username as value but got: \`${2}\`"
+        fi
+      ;;
+      -b|--base)
+        if [[ -n ${2} && "${2}" =~ ^/ ]]; then
+          _chrootDir="${2}"
+          [[ -d "${_chrootDir}" ]] && _err "${_chrootDir} already exists"
+          shift
+        else
+          _err "for ${1} expected full path to base directory for jails as value but got: \`${2}\`"
+        fi
+      ;;
+      *)
+        _err "Unexpected argument: \`${1}\`"
+      ;;
+    esac
+    shift
+  done
+  set -u
+fi
+
+main(){
+  _preChecks
+  _chrootBase
+  _generateUserKey
+  _generateCSRManifest
+  _checkCSR
+  _approveUserCsr
+  _generateKubeconfig
+  _confs
+  _helpMsg
+}
+
+# executing main function
+main
+
